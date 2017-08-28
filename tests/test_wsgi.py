@@ -8,19 +8,22 @@
     :copyright: (c) 2014 by Armin Ronacher.
     :license: BSD, see LICENSE for more details.
 """
+import io
+import json
+import os
+from contextlib import closing
+from os import path
+
 import pytest
 
-from os import path
-from contextlib import closing
-
 from tests import strict_eq
-
-from werkzeug.wrappers import BaseResponse
+from werkzeug import wsgi
+from werkzeug._compat import BytesIO, NativeStringIO, StringIO, to_bytes, \
+    to_native
 from werkzeug.exceptions import BadRequest, ClientDisconnected
 from werkzeug.test import Client, create_environ, run_wsgi_app
-from werkzeug import wsgi
-from werkzeug._compat import StringIO, BytesIO, NativeStringIO, to_native, \
-    to_bytes
+from werkzeug.wrappers import BaseResponse
+from werkzeug.wsgi import _RangeWrapper, wrap_file
 
 
 def test_shareddatamiddleware_get_file_loader():
@@ -241,6 +244,15 @@ def test_limited_stream():
     strict_eq(list(stream), [u'123\n', u'456\n'])
 
 
+def test_limited_stream_json_load():
+    stream = wsgi.LimitedStream(BytesIO(b'{"hello": "test"}'), 17)
+    # flask.json adapts bytes to text with TextIOWrapper
+    # this expects stream.readable() to exist and return true
+    stream = io.TextIOWrapper(io.BufferedReader(stream), 'UTF-8')
+    data = json.load(stream)
+    assert data == {'hello': 'test'}
+
+
 def test_limited_stream_disconnection():
     io = BytesIO(b'A bit of content')
 
@@ -381,6 +393,13 @@ def test_make_chunk_iter_bytes():
                                    buffer_size=4))
     assert rv == [b'abcdef', b'ghijkl', b'mnopqrstuvwxyz', b'ABCDEFGHIJK']
 
+    data = b'abcdefXghijklXmnopqrstuvwxyzXABCDEFGHIJK'
+    test_stream = BytesIO(data)
+    rv = list(wsgi.make_chunk_iter(test_stream, 'X', limit=len(data),
+                                   buffer_size=4, cap_at_buffer=True))
+    assert rv == [b'abcd', b'ef', b'ghij', b'kl', b'mnop', b'qrst', b'uvwx',
+                  b'yz', b'ABCD', b'EFGH', b'IJK']
+
 
 def test_lines_longer_buffer_size():
     data = '1234567890\n1234567890\n'
@@ -388,3 +407,63 @@ def test_lines_longer_buffer_size():
         lines = list(wsgi.make_line_iter(NativeStringIO(data), limit=len(data),
                                          buffer_size=4))
         assert lines == ['1234567890\n', '1234567890\n']
+
+
+def test_lines_longer_buffer_size_cap():
+    data = '1234567890\n1234567890\n'
+    for bufsize in range(1, 15):
+        lines = list(wsgi.make_line_iter(NativeStringIO(data), limit=len(data),
+                                         buffer_size=4, cap_at_buffer=True))
+        assert lines == ['1234', '5678', '90\n', '1234', '5678', '90\n']
+
+
+def test_range_wrapper():
+    response = BaseResponse(b'Hello World')
+    range_wrapper = _RangeWrapper(response.response, 6, 4)
+    assert next(range_wrapper) == b'Worl'
+
+    response = BaseResponse(b'Hello World')
+    range_wrapper = _RangeWrapper(response.response, 1, 0)
+    with pytest.raises(StopIteration):
+        next(range_wrapper)
+
+    response = BaseResponse(b'Hello World')
+    range_wrapper = _RangeWrapper(response.response, 6, 100)
+    assert next(range_wrapper) == b'World'
+
+    response = BaseResponse((x for x in (b'He', b'll', b'o ', b'Wo', b'rl', b'd')))
+    range_wrapper = _RangeWrapper(response.response, 6, 4)
+    assert not range_wrapper.seekable
+    assert next(range_wrapper) == b'Wo'
+    assert next(range_wrapper) == b'rl'
+
+    response = BaseResponse((x for x in (b'He', b'll', b'o W', b'o', b'rld')))
+    range_wrapper = _RangeWrapper(response.response, 6, 4)
+    assert next(range_wrapper) == b'W'
+    assert next(range_wrapper) == b'o'
+    assert next(range_wrapper) == b'rl'
+    with pytest.raises(StopIteration):
+        next(range_wrapper)
+
+    response = BaseResponse((x for x in (b'Hello', b' World')))
+    range_wrapper = _RangeWrapper(response.response, 1, 1)
+    assert next(range_wrapper) == b'e'
+    with pytest.raises(StopIteration):
+        next(range_wrapper)
+
+    resources = os.path.join(os.path.dirname(__file__), 'res')
+    env = create_environ()
+    with open(os.path.join(resources, 'test.txt'), 'rb') as f:
+        response = BaseResponse(wrap_file(env, f))
+        range_wrapper = _RangeWrapper(response.response, 1, 2)
+        assert range_wrapper.seekable
+        assert next(range_wrapper) == b'OU'
+        with pytest.raises(StopIteration):
+            next(range_wrapper)
+
+    with open(os.path.join(resources, 'test.txt'), 'rb') as f:
+        response = BaseResponse(wrap_file(env, f))
+        range_wrapper = _RangeWrapper(response.response, 2)
+        assert next(range_wrapper) == b'UND\n'
+        with pytest.raises(StopIteration):
+            next(range_wrapper)
